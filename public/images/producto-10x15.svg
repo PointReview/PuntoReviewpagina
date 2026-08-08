@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 750">
+<defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#0ea5e9"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs>
+<rect width="600" height="750" fill="#f8fafc"/>
+<rect x="125" y="70" width="350" height="540" rx="28" fill="white" stroke="#dbeafe" stroke-width="8"/>
+<rect x="155" y="105" width="290" height="165" rx="20" fill="url(#g)"/>
+<text x="300" y="165" text-anchor="middle" font-family="Arial" font-size="30" font-weight="700" fill="white">PuntoReview</text>
+<text x="300" y="210" text-anchor="middle" font-family="Arial" font-size="22" fill="white">QR + NFC</text>
+<rect x="190" y="315" width="220" height="220" rx="8" fill="white" stroke="#0f172a" stroke-width="8"/>
+<path d="M215 340h60v60h-60zm110 0h60v60h-60zm-110 110h60v60h-60zm80-30h20v20h-20zm35 45h35v35h-35z" fill="#0f172a"/>
+<text x="300" y="660" text-anchor="middle" font-family="Arial" font-size="20" fill="#64748b">IMAGEN DEL PRODUCTO</text>
+</svg>

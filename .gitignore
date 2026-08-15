@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Firebase / Google credentials
+serviceAccountKey.json
+firebase-applet-config.json
+*-firebase-adminsdk-*.json
+
+# Local databases / logs
+db.json
+db.json.*
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+# Scripts temporales de desarrollo/migración
+patch*.cjs
+test*.cjs
+temp.txt
+audit_report.txt
+finish_migration.cjs
+migrate_db.cjs 
+# Script que contiene una contraseña de administrador
+update_admin_pwd.cjs
+# Base de datos local y backups
+db.json
+db.*.json
+*.backup
+*.bak
+*.pre-*
+
+# Firebase / secretos locales
+.env
+.env.*
+!.env.example
+serviceAccountKey.json
+*-service-account.json
+
+# Build
+dist/

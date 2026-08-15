@@ -1,0 +1,830 @@
+import bcrypt from 'bcryptjs';
+import express from "express";
+import rateLimit from "express-rate-limit";
+import path from "path";
+import crypto from "crypto";
+import { initializeDB, getDB, saveDB } from "./firestore-db.ts";
+
+interface QRCode {
+  id: string;
+  code: string;
+  status: "UNACTIVATED" | "ACTIVE" | "DISABLED";
+  created_at: string;
+  activated_at: string | null;
+  client?: string;
+  destination_url?: string;
+  business_name?: string;
+  notes?: string;
+  reseller_id?: string;
+  business?: {
+    name: string;
+    address: string;
+    city: string;
+    google_place_id: string;
+    google_review_url: string;
+  };
+}
+
+interface Scan {
+  id: string;
+  qr_code_id: string;
+  scanned_at: string;
+  user_agent: string;
+  referer: string;
+}
+
+interface User {
+  id: string;
+  username: string;
+  name: string;
+  lastname: string;
+  email: string;
+  phone: string;
+  password?: string;
+  role: "ADMIN" | "RESELLER_ACTIVATOR" | "RESELLER_PRO";
+  account_status: "ACTIVE" | "SUSPENDED" | "DISABLED";
+  subscription_status: "ACTIVE" | "EXPIRED" | "NONE";
+  created_at: string;
+}
+
+interface Session {
+  token: string;
+  user_id: string;
+  created_at: string;
+}
+
+interface AdminAction {
+  id: string;
+  admin_id: string;
+  target_user_id: string;
+  action: string;
+  previous_status: string;
+  new_status: string;
+  created_at: string;
+}
+
+interface ResetToken {
+  token: string;
+  user_id: string;
+  expires_at: string;
+}
+
+interface Database {
+  reset_tokens?: ResetToken[];
+  qr_codes: QRCode[];
+  scans: Scan[];
+  users: User[];
+  sessions: Session[];
+  admin_actions: AdminAction[];
+}
+
+async function startServer() {
+  const app = express();
+  app.set("trust proxy", 1);
+  const PORT = Number(process.env.PORT) || 3000;
+
+await initializeDB();
+
+app.use(express.json());
+
+  const hashPassword = (password: string) => bcrypt.hashSync(password, 10);
+  
+  const isValidUrl = (url: string) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "http:" || parsed.protocol === "https:";
+    } catch (e) {
+      return false;
+    }
+  };
+
+  // --- Auth & Middlewares ---
+  
+  const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10, // Limit each IP to 10 requests per windowMs
+    message: { error: "Demasiados intentos de inicio de sesión. Por favor, intentá de nuevo más tarde." }
+  });
+
+  app.post("/api/auth/login", loginLimiter, (req, res) => {
+    const db = getDB();
+    const { username, password } = req.body;
+    
+    // Login supports username or email
+    const user = db.users.find(u => 
+      (u.username.toLowerCase() === username.toLowerCase() || u.email.toLowerCase() === username.toLowerCase()) && 
+      (u.password.startsWith("$2a$") || u.password.startsWith("$2b$") ? bcrypt.compareSync(password, u.password) : u.password === crypto.createHash("sha256").update(password).digest("hex"))
+    );
+
+    if (!user) {
+      res.status(401).json({ error: "Credenciales incorrectas" });
+      return;
+    }
+
+    if (user.account_status === "DISABLED") {
+      res.status(403).json({ error: "Tu cuenta está desactivada.\nContactá con PuntoReview para obtener asistencia." });
+      return;
+    }
+    
+    if (user.account_status === "SUSPENDED") {
+      res.status(403).json({ error: "Tu cuenta se encuentra temporalmente suspendida.\nContactá con PuntoReview para obtener asistencia." });
+      return;
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    db.sessions.push({ token, user_id: user.id, created_at: new Date().toISOString() });
+    saveDB(db);
+
+    const { password: _, ...userWithoutPass } = user;
+    res.json({ token, user: userWithoutPass });
+  });
+
+  app.get("/api/auth/me", (req, res) => {
+    const db = getDB();
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token) return res.status(401).json({ error: "No autorizado" });
+
+    const session = db.sessions.find(s => s.token === token);
+    if (!session) return res.status(401).json({ error: "Sesión inválida" });
+
+    const user = db.users.find(u => u.id === session.user_id);
+    if (!user || user.account_status !== "ACTIVE") {
+      return res.status(401).json({ error: "Usuario inactivo o no encontrado" });
+    }
+
+    const { password: _, ...userWithoutPass } = user;
+    res.json({ user: userWithoutPass });
+  });
+
+  
+  app.post("/api/auth/forgot-password", async (req, res) => {
+    const db = getDB();
+    const { email } = req.body;
+    
+    if (!email) {
+      res.status(400).json({ error: "El correo electrónico es requerido" });
+      return;
+    }
+    
+    const user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+    if (!user) {
+      // Don't leak whether user exists or not, but return success
+      res.json({ success: true, message: "Si el correo está registrado, recibirás un enlace de recuperación." });
+      return;
+    }
+    
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 3600000).toISOString(); // 1 hour from now
+    
+    if (!db.reset_tokens) db.reset_tokens = [];
+    db.reset_tokens.push({
+      token: resetToken,
+      user_id: user.id,
+      expires_at: expiresAt
+    });
+    
+    saveDB(db);
+    
+    try {
+      const nodemailer = await import("nodemailer");
+      // Use ethereal for testing if no credentials provided, or log to console
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || "smtp.ethereal.email",
+        port: parseInt(process.env.SMTP_PORT || "587"),
+        secure: process.env.SMTP_SECURE === "true",
+        auth: {
+          user: process.env.SMTP_USER || "test",
+          pass: process.env.SMTP_PASS || "test"
+        }
+      });
+      
+      const resetLink = `${req.protocol}://${req.get('host')}/reset-password?token=${resetToken}`;
+      
+      if (!process.env.SMTP_USER) {
+        console.log("----------------------------------------");
+        console.log("MOCK EMAIL SENT");
+        console.log("To:", user.email);
+        console.log("Subject: Recuperación de contraseña - PuntoReview");
+        console.log("Reset Link:", resetLink);
+        console.log("----------------------------------------");
+      } else {
+        await transporter.sendMail({
+          from: process.env.EMAIL_FROM || '"PuntoReview" <no-reply@puntoreview.com>',
+          to: user.email,
+          subject: 'Recuperación de contraseña - PuntoReview',
+          html: `
+            <div style="font-family: sans-serif; max-w-2xl; margin: 0 auto;">
+              <h2 style="color: #1e293b;">Recuperación de contraseña</h2>
+              <p>Hola ${user.name},</p>
+              <p>Has solicitado restablecer tu contraseña en PuntoReview. Hacé clic en el siguiente enlace para crear una nueva contraseña:</p>
+              <div style="margin: 30px 0;">
+                <a href="${resetLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold;">Restablecer contraseña</a>
+              </div>
+              <p style="color: #64748b; font-size: 14px;">Este enlace expirará en 1 hora.</p>
+              <p style="color: #64748b; font-size: 14px;">Si no solicitaste este cambio, podés ignorar este correo.</p>
+            </div>
+          `
+        });
+      }
+      
+      
+      if (!process.env.SMTP_USER) {
+        res.json({ success: true, message: "Si el correo está registrado, recibirás un enlace de recuperación.", demo_token: resetToken });
+      } else {
+        res.json({ success: true, message: "Si el correo está registrado, recibirás un enlace de recuperación." });
+      }
+    } catch (err: any) {
+      console.error("Error sending email:", err);
+      // Still return success to prevent email enumeration, or return a generic error.
+      res.json({ success: true, message: "Si el correo está registrado, recibirás un enlace de recuperación." });
+    }
+  });
+
+  app.post("/api/auth/reset-password", (req, res) => {
+    const db = getDB();
+    const { token, newPassword } = req.body;
+    
+    if (!token || !newPassword) {
+      res.status(400).json({ error: "Token y nueva contraseña son requeridos" });
+      return;
+    }
+    
+    if (!db.reset_tokens) db.reset_tokens = [];
+    const tokenRecordIndex = db.reset_tokens.findIndex(rt => rt.token === token);
+    
+    if (tokenRecordIndex === -1) {
+      res.status(400).json({ error: "El enlace es inválido o ha expirado" });
+      return;
+    }
+    
+    const tokenRecord = db.reset_tokens[tokenRecordIndex];
+    if (new Date(tokenRecord.expires_at).getTime() < Date.now()) {
+      res.status(400).json({ error: "El enlace ha expirado" });
+      return;
+    }
+    
+    const user = db.users.find(u => u.id === tokenRecord.user_id);
+    if (!user) {
+      res.status(400).json({ error: "Usuario no encontrado" });
+      return;
+    }
+    
+    if (newPassword.length < 6) {
+      res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres" });
+      return;
+    }
+    
+    // Hash and save new password
+    user.password = hashPassword(newPassword);
+    
+    // Remove used token
+    db.reset_tokens.splice(tokenRecordIndex, 1);
+    
+    saveDB(db);
+    res.json({ success: true, message: "Contraseña actualizada correctamente" });
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    const db = getDB();
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (token && token !== "null") {
+      db.sessions = db.sessions.filter(s => s.token !== token);
+      saveDB(db);
+    }
+    res.json({ success: true });
+  });
+
+    const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const db = getDB();
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token) {
+      res.status(401).json({ error: "No autorizado" });
+      return;
+    }
+    const session = db.sessions.find(s => s.token === token);
+    if (!session) {
+      res.status(401).json({ error: "Sesión expirada" });
+      return;
+    }
+    const user = db.users.find(u => u.id === session.user_id);
+    if (!user || user.account_status !== "ACTIVE") {
+      res.status(403).json({ error: "Cuenta inactiva" });
+      return;
+    }
+    (req as any).user = user;
+    next();
+  };
+
+  const optionalAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const db = getDB();
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (token && token !== "null") {
+      const session = db.sessions.find(s => s.token === token);
+      if (session) {
+        const user = db.users.find(u => u.id === session.user_id);
+        if (user && user.account_status === "ACTIVE") {
+          (req as any).user = user;
+        }
+      }
+    }
+    next();
+  };
+
+  const requireRole = (roles: ("ADMIN" | "RESELLER_PRO" | "RESELLER_ACTIVATOR")[]) => {
+    return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      if (!(req as any).user || !roles.includes((req as any).user.role)) {
+        res.status(403).json({ error: "No tenés permisos para acceder a esta sección." });
+        return;
+      }
+      next();
+    };
+  };
+
+  const requireAdmin = [requireAuth, requireRole(["ADMIN"])];
+  const requireManageQR = [requireAuth, requireRole(["ADMIN", "RESELLER_PRO"])];
+
+  // --- API Routes ---
+
+  // Admin: Get all QR codes
+  app.get("/api/admin/qr", requireManageQR, (req, res) => {
+    const db = getDB();
+    
+    // Filter for PRO
+    let qrs = db.qr_codes;
+    if ((req as any).user!.role !== "ADMIN") {
+       qrs = qrs.filter(qr => qr.reseller_id === (req as any).user!.id);
+    }
+    
+    // Add scan counts
+    const qrsWithStats = qrs.map(qr => {
+      const scans = db.scans.filter(s => s.qr_code_id === qr.id);
+      return {
+        ...qr,
+        scanCount: scans.length,
+        lastScan: scans.length > 0 ? scans[scans.length - 1].scanned_at : null
+      };
+    });
+
+    res.json(qrsWithStats);
+  });
+
+
+  // Admin: Generate Bulk QR codes
+  app.post("/api/admin/qr/bulk", requireManageQR, (req, res) => {
+    const db = getDB();
+    const user = (req as any).user;
+    
+    if (user.role === "RESELLER_PRO" && user.subscription_status === "EXPIRED") {
+       res.status(403).json({ error: "Suscripción expirada. No podés generar más códigos." });
+       return;
+    }
+
+    const quantity = parseInt(req.body.quantity) || 1;
+    if (quantity < 1 || quantity > 100) {
+      res.status(400).json({ error: "La cantidad debe ser entre 1 y 100" });
+      return;
+    }
+
+    
+    const generateCode = () => "PR-" + crypto.randomBytes(3).toString("hex").toUpperCase();
+    const newQRs = [];
+    for (let i = 0; i < quantity; i++) {
+      let code = generateCode();
+      while(db.qr_codes.some(q => q.code === code) || newQRs.some(q => q.code === code)) {
+        code = generateCode();
+      }
+
+      
+      const qr: QRCode = {
+        id: crypto.randomUUID(),
+        code,
+        status: "UNACTIVATED",
+        created_at: new Date().toISOString(),
+        activated_at: null,
+        client: "Sin cliente",
+        reseller_id: user.role === "ADMIN" ? "ADMIN" : user.id
+      };
+      db.qr_codes.push(qr);
+      newQRs.push(qr);
+    }
+    
+    saveDB(db);
+    res.json(newQRs);
+  });
+
+  // Admin: Generate new QR code
+  app.post("/api/admin/qr", requireManageQR, (req, res) => {
+    const db = getDB();
+    
+    // Check subscription status for PRO
+    const user = (req as any).user;
+    if (user.role === "RESELLER_PRO" && user.subscription_status === "EXPIRED") {
+       res.status(403).json({ error: "Suscripción expirada. No podés generar más códigos." });
+       return;
+    }
+
+    let code = req.body.code;
+    if (code) {
+      code = code.toUpperCase();
+      if (db.qr_codes.some(q => q.code === code)) {
+        res.status(400).json({ error: "El código ya está en uso" });
+        return;
+      }
+    } else {
+      // Generate code: PR-XXXXXX
+      const generateCode = () => "PR-" + crypto.randomBytes(3).toString("hex").toUpperCase();
+      code = generateCode();
+      while(db.qr_codes.some(q => q.code === code)) {
+        code = generateCode();
+      }
+    }
+
+    const newQR: QRCode = {
+      id: crypto.randomUUID(),
+      code,
+      status: "UNACTIVATED" as const,
+      created_at: new Date().toISOString(),
+      activated_at: null,
+      client: "Sin cliente",
+      reseller_id: (req as any).user!.role === "ADMIN" ? "ADMIN" : (req as any).user!.id
+    };
+
+    db.qr_codes.push(newQR);
+    saveDB(db);
+    res.json(newQR);
+  });
+  
+  // Admin: Update QR details
+  app.put("/api/admin/qr/:id", requireManageQR, (req, res) => {
+    const db = getDB();
+    const user = (req as any).user;
+    const qr = db.qr_codes.find(q => q.id === req.params.id);
+    if (!qr) {
+       res.status(404).json({ error: "QR no encontrado" });
+       return;
+    }
+    
+    if ((req as any).user!.role !== "ADMIN" && qr.reseller_id !== (req as any).user!.id) {
+       res.status(403).json({ error: "No autorizado para modificar este QR" });
+       return;
+    }
+    
+    if (req.body.destination_url !== undefined) {
+       if (!isValidUrl(req.body.destination_url)) {
+         res.status(400).json({ error: "URL inválida o protocolo no permitido (usar http o https)" });
+         return;
+       }
+       qr.destination_url = req.body.destination_url;
+    }
+    if (req.body.business_name !== undefined) {
+      qr.business_name = req.body.business_name;
+      qr.client = req.body.business_name;
+    }
+    if (req.body.notes !== undefined) qr.notes = req.body.notes;
+    
+    saveDB(db);
+    
+    // Sanitize output for non-owners to prevent leaking notes/client
+    if (user.role !== "ADMIN" && qr.reseller_id !== user.id) {
+      res.json({
+        id: qr.id,
+        code: qr.code,
+        status: qr.status,
+        business_name: qr.business_name,
+        destination_url: qr.destination_url,
+        business: qr.business
+      });
+    } else {
+      res.json(qr);
+    }
+  
+  });
+  
+  // Admin: Toggle QR status
+  
+  // Delete QR Code
+  app.delete("/api/admin/qr/:id", requireManageQR, (req, res) => {
+    const db = getDB();
+    const user = (req as any).user;
+    const index = db.qr_codes.findIndex(q => q.id === req.params.id);
+    
+    if (index === -1) {
+      res.status(404).json({ error: "Código no encontrado" });
+      return;
+    }
+    
+    if (user.role !== "ADMIN" && db.qr_codes[index].reseller_id !== user.id) {
+      res.status(403).json({ error: "Acceso denegado" });
+      return;
+    }
+    
+    db.qr_codes.splice(index, 1);
+    saveDB(db);
+    res.json({ success: true });
+  });
+
+  app.put("/api/admin/qr/:id/status", requireManageQR, (req, res) => {
+    const db = getDB();
+    const qr = db.qr_codes.find(q => q.id === req.params.id);
+    if (!qr) {
+       res.status(404).json({ error: "QR no encontrado" });
+       return;
+    }
+    
+    if ((req as any).user!.role !== "ADMIN" && qr.reseller_id !== (req as any).user!.id) {
+       res.status(403).json({ error: "No autorizado para modificar este QR" });
+       return;
+    }
+    
+    qr.status = req.body.status;
+    saveDB(db);
+    res.json(qr);
+  });
+
+  // User: Update Profile
+  app.put("/api/user/profile", requireAuth, (req, res) => {
+    const db = getDB();
+    const user = db.users.find(u => u.id === (req as any).user.id);
+    if (!user) {
+      res.status(404).json({ error: "Usuario no encontrado" });
+      return;
+    }
+    
+    // Prevent IDOR and Escalation
+    const { name, lastname, email } = req.body;
+    if (name) user.name = name;
+    if (lastname) user.lastname = lastname;
+    if (email) user.email = email;
+    
+    saveDB(db);
+    const { password: _, ...userWithoutPass } = user;
+    res.json(userWithoutPass);
+  });
+
+  // User: Update Password
+  app.put("/api/user/password", requireAuth, (req, res) => {
+    const db = getDB();
+    const user = db.users.find(u => u.id === (req as any).user.id);
+    if (!user) {
+      res.status(404).json({ error: "Usuario no encontrado" });
+      return;
+    }
+    
+    const { currentPassword, newPassword } = req.body;
+    if (!(user.password.startsWith("$2a$") || user.password.startsWith("$2b$") ? bcrypt.compareSync(currentPassword, user.password) : user.password === crypto.createHash("sha256").update(currentPassword).digest("hex"))) {
+      res.status(400).json({ error: "La contraseña actual es incorrecta" });
+      return;
+    }
+    
+    if (newPassword.length < 6) {
+      res.status(400).json({ error: "La nueva contraseña debe tener al menos 6 caracteres" });
+      return;
+    }
+    
+    user.password = hashPassword(newPassword);
+    saveDB(db);
+    res.json({ success: true });
+  });
+
+  // Admin: Get all users
+  app.get("/api/admin/users", requireAdmin, (req, res) => {
+    const db = getDB();
+    const usersWithStats = db.users.map(u => {
+        const { password: _, ...userWithoutPass } = u;
+        const qrs = db.qr_codes.filter(q => q.reseller_id === u.id);
+        const qrCount = qrs.length;
+        const activationCount = qrs.filter(q => q.status === "ACTIVE").length;
+        return {
+          ...userWithoutPass,
+          qrCount,
+          activationCount
+        };
+    });
+    res.json(usersWithStats);
+  });
+
+  // Admin: Update user status
+  app.put("/api/admin/users/:id/status", requireAdmin, (req, res) => {
+    const db = getDB();
+    const user = db.users.find(u => u.id === req.params.id);
+    if (!user) {
+       res.status(404).json({ error: "Usuario no encontrado" });
+       return;
+    }
+    
+    if (user.id === (req as any).user.id) {
+       res.status(400).json({ error: "No podés cambiar tu propio estado" });
+       return;
+    }
+    
+    const previous_status = user.account_status;
+    const new_status = req.body.status;
+    
+    user.account_status = new_status;
+    
+    // Log action
+    db.admin_actions.push({
+      id: crypto.randomUUID(),
+      admin_id: (req as any).user.id,
+      target_user_id: user.id,
+      action: `${new_status}_ACCOUNT`,
+      previous_status,
+      new_status,
+      created_at: new Date().toISOString()
+    });
+
+    saveDB(db);
+    const { password: _, ...userWithoutPass } = user;
+    res.json(userWithoutPass);
+  });
+
+  // Admin: Create new user
+  app.post("/api/admin/users", requireAdmin, (req, res) => {
+    const db = getDB();
+    const { name, lastname, username, email, phone, password, role, account_status } = req.body;
+    
+    if (db.users.some(u => u.username === username || u.email === email)) {
+      res.status(400).json({ error: "El usuario o email ya existe" });
+      return;
+    }
+    
+    const newUser: User = {
+      id: crypto.randomUUID(),
+      username,
+      name,
+      lastname,
+      email,
+      phone,
+      password: hashPassword(password),
+      role,
+      account_status,
+      subscription_status: "NONE",
+      created_at: new Date().toISOString()
+    };
+    
+    db.users.push(newUser);
+    saveDB(db);
+    
+    const { password: _, ...userWithoutPass } = newUser;
+    res.json(userWithoutPass);
+  });
+
+  // Admin: Get activity log
+  app.get("/api/admin/actions", requireAdmin, (req, res) => {
+    const db = getDB();
+    // Return actions with user details
+    const actions = db.admin_actions.map(action => {
+      const targetUser = db.users.find(u => u.id === action.target_user_id);
+      return {
+        ...action,
+        target_user_name: targetUser ? targetUser.name : "Desconocido"
+      };
+    }).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    res.json(actions);
+  });
+
+  
+  const qrLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minutes
+    max: 60, // Limit each IP to 60 requests
+    message: { error: "Demasiadas peticiones. Por favor, intentá de nuevo más tarde." }
+  });
+
+  const activateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10, // Limit each IP to 10 activation attempts
+    message: { error: "Demasiados intentos de activación. Por favor, intentá de nuevo más tarde." }
+  });
+
+  // Client: Get QR details for activation
+  app.get("/api/qr/:code", qrLimiter, optionalAuth, (req, res) => {
+    const db = getDB();
+    const code = req.params.code.toUpperCase();
+    const qr = db.qr_codes.find(q => q.code === code);
+    if (!qr) {
+       res.status(404).json({ error: "QR no encontrado" });
+       return;
+    }
+    
+    const user = (req as any).user;
+    if (user && user.role !== "ADMIN" && qr.reseller_id && qr.reseller_id !== "ADMIN" && qr.reseller_id !== user.id) {
+      res.status(403).json({ error: "Este QR pertenece a otro revendedor." });
+      return;
+    }
+    
+    res.json(qr);
+  });
+
+  // Client: Activate QR
+  app.post("/api/qr/:code/activate", activateLimiter, optionalAuth, (req, res) => {
+    const db = getDB();
+    const code = req.params.code.toUpperCase();
+    const qr = db.qr_codes.find(q => q.code === code);
+    
+    if (!qr) {
+      res.status(404).json({ error: "QR no encontrado" });
+      return;
+    }
+
+    if (qr.status !== "UNACTIVATED") {
+      res.status(400).json({ error: "El QR no se puede activar en su estado actual" });
+      return;
+    }
+    
+    const user = (req as any).user;
+    if (user && user.role !== "ADMIN" && qr.reseller_id && qr.reseller_id !== "ADMIN" && qr.reseller_id !== user.id) {
+      res.status(403).json({ error: "Este QR pertenece a otro revendedor." });
+      return;
+    }
+
+    const { destination_url, business_name } = req.body;
+
+    if (!destination_url) {
+      res.status(400).json({ error: "Se requiere la URL de destino" });
+      return;
+    }
+    
+    if (!isValidUrl(destination_url)) {
+      res.status(400).json({ error: "URL inválida o protocolo no permitido (usar http o https)" });
+      return;
+    }
+
+    qr.status = "ACTIVE";
+    qr.activated_at = new Date().toISOString();
+    qr.destination_url = destination_url;
+    // Add logic to save activated_by if it's not already in the interface, or just rely on notes for now, but better to update the interface. Let's update `reseller_id` if empty.
+    if (!qr.reseller_id || qr.reseller_id === "ADMIN") {
+       if (user && user.role !== "ADMIN") {
+         qr.reseller_id = (req as any).user.id;
+       }
+    }
+    
+    if (business_name) {
+      qr.business_name = business_name;
+      qr.client = business_name;
+    }
+
+    saveDB(db);
+    res.json(qr);
+  });
+
+  // Client: Scan QR (Redirect)
+  app.get("/api/scan/:code", qrLimiter, (req, res) => {
+    const db = getDB();
+    const code = req.params.code.toUpperCase();
+    const qr = db.qr_codes.find(q => q.code === code);
+    
+    if (!qr) {
+      res.status(404).json({ error: "QR_NOT_FOUND" });
+      return;
+    }
+    
+    const targetUrl = qr.destination_url || qr.business?.google_review_url;
+
+    if (qr.status === "UNACTIVATED" || (!targetUrl && qr.status !== "DISABLED")) {
+      res.status(400).json({ error: "QR_UNACTIVATED" });
+      return;
+    }
+
+    if (qr.status !== "ACTIVE" || !targetUrl) {
+      res.status(400).json({ error: "QR_DISABLED" });
+      return;
+    }
+
+    // Register scan
+    db.scans.push({
+      id: crypto.randomUUID(),
+      qr_code_id: qr.id,
+      scanned_at: new Date().toISOString(),
+      user_agent: req.headers["user-agent"] || "",
+      referer: req.headers.referer || ""
+    });
+    saveDB(db);
+
+    res.json({ url: targetUrl });
+  });
+
+  // --- Vite / Frontend Serving ---
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+startServer();
+
+
